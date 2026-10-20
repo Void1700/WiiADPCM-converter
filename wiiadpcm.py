@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 """
-Conversor audio (mp3, wav, ogg...) <-> WIIADPCM (DSP-ADPCM de Nintendo, estéreo,
-bloques de 64 KiB intercalados), el formato de tus bombshock2 / Borne_Free2.
+Audio (mp3, wav, ogg...) <-> WIIADPCM converter (Nintendo DSP-ADPCM, stereo,
+interleaved 64 KiB blocks).
 
-Requisitos: python3, numpy y ffmpeg en el PATH.
+Requirements: python3, numpy and ffmpeg in the PATH.
 
-  Codificar:   python3 wiiadpcm.py encode cancion.mp3 nuevo.adpcm [--ref original.adpcm]
-  Decodificar: python3 wiiadpcm.py decode original.adpcm salida.wav
+  Encode:  python3 wiiadpcm.py encode song.mp3 new.adpcm [--ref original.adpcm]
+  Decode:  python3 wiiadpcm.py decode original.adpcm output.wav
 
-Estructura del archivo (deducida de tus dumps):
-  - Bloques de 0x10000 bytes alternando canal 0, canal 1, canal 0, canal 1...
-  - Los dos primeros bloques empiezan con una cabecera de 0x70 bytes por canal:
+File structure:
+  - 0x10000-byte blocks alternating channel 0, channel 1, channel 0, channel 1...
+  - The first two blocks start with a 0x70-byte header per channel:
       0x00  "WIIADPCM"
-      0x08  u32  (canal 0: 0x00010010, canal 1: 0)   <- significado desconocido, se copia
-      0x0C  u32  0x10000 (tamaño de bloque)
-      0x10  u32  nº de samples        0x14 u32 nº de nibbles
+      0x08  u32  (channel 0: 0x00010010, channel 1: 0)   <- meaning unknown, copied as is
+      0x0C  u32  0x10000 (block size)
+      0x10  u32  number of samples   0x14 u32 number of nibbles
       0x18  u32  sample rate (32000)  0x1C u16 loop flag, u16 formato (0, 0)
-      0x20  u32  inicio (2)   0x24 u32 fin (nibbles-1)   0x28 u32 actual (2)
-      0x2C  16 x s16  coeficientes DSP-ADPCM (8 pares)
-      0x4C  gain(0), ps (1er byte de datos), hist1, hist2 ... resto a 0 hasta 0x70
-  - Datos: frames de 8 bytes = 14 samples (cabecera predictor<<4|escala + 7 bytes de nibbles).
-  - Todo el archivo se rellena con ceros hasta completar bloques de 64 KiB.
+      0x20  u32  start (2)   0x24 u32 end (nibbles-1)   0x28 u32 current (2)
+      0x2C  16 x s16  DSP-ADPCM coefficients (8 pairs)
+      0x4C  gain(0), ps (1st data byte), hist1, hist2 ... rest zeros up to 0x70
+  - Data: 8-byte frames = 14 samples (header predictor<<4|scale + 7 bytes of nibbles).
+  - The whole file is padded with zeros to complete 64 KiB blocks.
 """
 import argparse
 import struct
@@ -33,10 +33,10 @@ import numpy as np
 
 BLOCK = 0x10000
 HDR = 0x70
-SPF = 14  # samples por frame
+SPF = 14  # samples per frame
 
 
-# ----------------------------------------------------------------- utilidades
+# ----------------------------------------------------------------- utilities
 def nibble_addr(sample):
     return (sample // SPF) * 16 + sample % SPF + 2
 
@@ -62,9 +62,9 @@ def _frames(x):
     return xe, idx, F
 
 
-# ------------------------------------------------- cálculo de los 8 coeficientes
+# ------------------------------------------------- computing the 8 coefficients
 def find_coefs(x, K=8):
-    """Predictores de orden 2 por mínimos cuadrados + agrupación LBG (K pares)."""
+    """Order-2 least-squares predictors + LBG clustering (K pairs)."""
     xe, idx, F = _frames(x.astype(np.float64))
     cur, p1, p2 = xe[idx + 2], xe[idx + 1], xe[idx]
     R11 = (p1 * p1).sum(1); R12 = (p1 * p2).sum(1); R22 = (p2 * p2).sum(1)
@@ -98,15 +98,15 @@ def find_coefs(x, K=8):
     return Q
 
 
-# ------------------------------------------------------------- codificación
+# ------------------------------------------------------------- encoding
 def encode_channel(x):
-    """x: int16 de un canal -> (coefs (8x2), bytes de frames)"""
+    """x: int16 samples of one channel -> (coefs (8x2), frame bytes)"""
     n = len(x)
     C = find_coefs(x)
     xe, idx, F = _frames(x.astype(np.float64))
     cur, p1, p2 = xe[idx + 2], xe[idx + 1], xe[idx]
 
-    # elección en bucle abierto: escala necesaria y error de cada predictor
+    # open-loop choice: required scale and error of each predictor
     scale = np.zeros((F, 8))
     sq = np.zeros((F, 8))
     for k in range(8):
@@ -114,7 +114,7 @@ def encode_channel(x):
         m = np.abs(e).max(1)
         scale[:, k] = np.clip(np.ceil(np.log2(np.maximum(m, 1e-9) / 7.5)), 0, 12)
         sq[:, k] = (e * e).sum(1)
-    order = np.argsort(scale * 1e12 + sq, axis=1)[:, :2].tolist()  # 2 mejores
+    order = np.argsort(scale * 1e12 + sq, axis=1)[:, :2].tolist()  # 2 best
     scale = scale.astype(int).tolist()
     del cur, p1, p2, xe, idx
 
@@ -180,7 +180,7 @@ def make_header(ch, n, rate, coefs, first_byte, prefix):
 def encode(args):
     pcm = load_audio(args.input, args.rate)
     n = len(pcm)
-    print(f"Audio: {n} samples/canal a {args.rate} Hz = {n / args.rate:.1f} s")
+    print(f"Audio: {n} samples/channel at {args.rate} Hz = {n / args.rate:.1f} s")
 
     prefixes = [struct.pack(">II", 0x10010, BLOCK), struct.pack(">II", 0, BLOCK)]
     if args.ref:
@@ -203,19 +203,19 @@ def encode(args):
             out += blk.ljust(BLOCK, b"\0")
     with open(args.output, "wb") as f:
         f.write(out)
-    print(f"Escrito {args.output}: {len(out)} bytes ({nblk * 2} bloques de 64 KiB)")
+    print(f"Written {args.output}: {len(out)} bytes ({nblk * 2} blocks of 64 KiB)")
     if args.ref:
         import os
         ref_size = os.path.getsize(args.ref)
         if len(out) > ref_size:
-            print(f"AVISO: es {len(out) - ref_size} bytes MÁS GRANDE que el original "
-                  f"({ref_size}). Si el juego/archivo contenedor espera ese tamaño, "
-                  f"recorta el audio.")
+            print(f"WARNING: it is {len(out) - ref_size} bytes LARGER than the original "
+                  f"({ref_size}). If the game/container file expects that size, "
+                  f"trim the audio.")
         else:
-            print(f"Tamaño original: {ref_size} bytes (el nuevo cabe).")
+            print(f"Original size: {ref_size} bytes (the new one fits).")
 
 
-# ------------------------------------------------------------- decodificación
+# ------------------------------------------------------------- decoding
 def decode_stream(data, coefs, n):
     c = list(coefs)
     out = np.zeros(n, np.int16)
@@ -242,7 +242,7 @@ def decode_stream(data, coefs, n):
 
 def decode(args):
     d = open(args.input, "rb").read()
-    assert d[:8] == b"WIIADPCM", "No parece un WIIADPCM"
+    assert d[:8] == b"WIIADPCM", "This does not look like a WIIADPCM file"
     n = struct.unpack(">I", d[0x10:0x14])[0]
     rate = struct.unpack(">I", d[0x18:0x1C])[0]
     chans = [bytearray(), bytearray()]
@@ -256,15 +256,15 @@ def decode(args):
     with wave.open(args.output, "wb") as w:
         w.setnchannels(2); w.setsampwidth(2); w.setframerate(rate)
         w.writeframes(st.astype("<i2").tobytes())
-    print(f"Escrito {args.output}: {n} samples/canal, {rate} Hz, {n / rate:.1f} s")
+    print(f"Written {args.output}: {n} samples/channel, {rate} Hz, {n / rate:.1f} s")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     e = sub.add_parser("encode"); e.add_argument("input"); e.add_argument("output")
-    e.add_argument("--rate", type=int, default=32000, help="por defecto 32000 (el de tus archivos)")
-    e.add_argument("--ref", help="adpcm original: copia campos desconocidos y avisa si el tamaño se pasa")
+    e.add_argument("--rate", type=int, default=32000, help="default 32000 (the rate of your files)")
+    e.add_argument("--ref", help="original adpcm: copies unknown fields and warns if the size is exceeded")
     e.set_defaults(fn=encode)
     d_ = sub.add_parser("decode"); d_.add_argument("input"); d_.add_argument("output")
     d_.set_defaults(fn=decode)
